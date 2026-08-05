@@ -1,5 +1,5 @@
-import { useState, useEffect } from "react";
-import { motion, AnimatePresence } from "framer-motion";
+import { useState, useEffect, useRef } from "react";
+import { motion } from "framer-motion";
 import {
   Mic,
   MicOff,
@@ -20,377 +20,349 @@ import Navbar from "../components/Navbar";
 import Button from "../components/ui/Button";
 import Card from "../components/ui/Card";
 import { LoadingSpinner } from "../components/ui/LoadingSpinner";
+import useWebRTC from "../hooks/useWebRTC";
+import { useAuth } from "../context/AuthContext";
 
 const InterviewRoom = () => {
   const navigate = useNavigate();
   const [searchParams] = useSearchParams();
-  const [isMicOn, setIsMicOn] = useState(true);
-  const [isCameraOn, setIsCameraOn] = useState(true);
-  const [isScreenSharing, setIsScreenSharing] = useState(false);
-  const [isInCall, setIsInCall] = useState(false);
-  const [time, setTime] = useState(0);
-  const [showSettings, setShowSettings] = useState(false);
-
   const meetingId = searchParams.get("id") || "demo-room";
 
+  // Pre-call device check state
+  const [previewStream, setPreviewStream] = useState(null);
+  const [cameraReady, setCameraReady] = useState(false);
+  const [micReady, setMicReady] = useState(false);
+  const [deviceError, setDeviceError] = useState(null);
+  const [joinRequested, setJoinRequested] = useState(false);
+  const [time, setTime] = useState(0);
+
+  // notifications
+  const [notice, setNotice] = useState(null);
+
+  const localPreviewRef = useRef(null);
+  const { token, user } = useAuth();
+  const serverUrl = import.meta.env.VITE_SOCKET_SERVER || window.location.origin;
+
+  // Only mount hook when user requested join (so preview + device check happens first)
+  const webrtc = joinRequested
+    ? useWebRTC({
+        serverUrl,
+        meetingId,
+        token,
+        options: {
+          iceServers: [
+            { urls: import.meta.env.VITE_STUN_SERVER || "stun:stun.l.google.com:19302" },
+            ...(import.meta.env.VITE_TURN_SERVER
+              ? [
+                  {
+                    urls: import.meta.env.VITE_TURN_SERVER,
+                    username: import.meta.env.VITE_TURN_USERNAME,
+                    credential: import.meta.env.VITE_TURN_PASSWORD,
+                  },
+                ]
+              : []),
+          ],
+        },
+      })
+    : null;
+
+  // timer
   useEffect(() => {
     let interval;
-    if (isInCall) {
-      interval = setInterval(() => {
-        setTime((prev) => prev + 1);
-      }, 1000);
+    if (webrtc?.inCall) {
+      interval = setInterval(() => setTime((t) => t + 1), 1000);
     }
     return () => clearInterval(interval);
-  }, [isInCall]);
+  }, [webrtc?.inCall]);
 
-  const formatTime = (seconds) => {
-    const mins = Math.floor(seconds / 60);
-    const secs = seconds % 60;
-    return `${mins.toString().padStart(2, "0")}:${secs.toString().padStart(2, "0")}`;
+  const formatTime = (s) => {
+    const m = Math.floor(s / 60)
+      .toString()
+      .padStart(2, "0");
+    const sec = (s % 60).toString().padStart(2, "0");
+    return `${m}:${sec}`;
   };
 
+  // Pre-call: get preview media and test devices
+  useEffect(() => {
+    let mounted = true;
+    const getPreview = async () => {
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+        if (!mounted) {
+          stream.getTracks().forEach((t) => t.stop());
+          return;
+        }
+        setPreviewStream(stream);
+        setCameraReady(!!stream.getVideoTracks().length);
+        setMicReady(!!stream.getAudioTracks().length);
+        setDeviceError(null);
+        if (localPreviewRef.current) localPreviewRef.current.srcObject = stream;
+      } catch (err) {
+        console.warn("device preview error", err);
+        setDeviceError(err?.message || "Camera/Microphone access denied");
+        setCameraReady(false);
+        setMicReady(false);
+      }
+    };
+    getPreview();
+    return () => {
+      mounted = false;
+      if (previewStream) {
+        previewStream.getTracks().forEach((t) => t.stop());
+      }
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Notification helper
+  useEffect(() => {
+    if (!webrtc) return;
+    // participant join/left notices
+    const prevLen = { current: webrtc.participants?.length || 0 };
+    const unsub = () => {};
+    const check = () => {
+      const len = webrtc.participants?.length || 0;
+      if (len > prevLen.current) {
+        setNotice("User joined");
+        setTimeout(() => setNotice(null), 3000);
+      } else if (len < prevLen.current) {
+        setNotice("User left");
+        setTimeout(() => setNotice(null), 3000);
+      }
+      prevLen.current = len;
+    };
+    const iv = setInterval(check, 500);
+    return () => clearInterval(iv);
+  }, [webrtc]);
+
+  // Join button handler
   const handleJoinCall = () => {
-    setIsInCall(true);
-    setTime(0);
+    // Ensure preview devices ok
+    if (deviceError) return;
+    setJoinRequested(true);
   };
 
   const handleLeaveCall = () => {
-    setIsInCall(false);
-    setTime(0);
+    if (webrtc && webrtc.endCall) webrtc.endCall();
+    setJoinRequested(false);
+    if (previewStream) previewStream.getTracks().forEach((t) => t.stop());
     navigate("/dashboard");
   };
 
-  const mockParticipants = [
-    { id: 1, name: "John Doe", role: "Candidate", avatar: "JD", isSpeaking: true },
-    { id: 2, name: "You", role: "Interviewer", avatar: "ME", isSpeaking: false },
-  ];
+  // useWebRTC bound controls
+  const toggleMic = () => webrtc?.toggleMic();
+  const toggleCamera = () => webrtc?.toggleCamera();
+  const startScreenShare = () => webrtc?.startScreenShare();
+
+  // Connection status computation
+  const connectionStatus = () => {
+    if (!webrtc) return deviceError ? "Failed" : "Not connected";
+    if (webrtc.error) return "Failed";
+    if (!webrtc.connected) return "Connecting";
+    if (webrtc.inCall) return "Connected";
+    return "Connected";
+  };
+
+  // Render helpers
+  const renderStatusBadge = () => {
+    const status = connectionStatus();
+    const color = status === "Connected" ? "bg-green-500" : status === "Connecting" ? "bg-yellow-400" : "bg-red-500";
+    return (
+      <div className={`inline-flex items-center gap-2 px-3 py-1 rounded-full ${color} text-black text-sm`}> 
+        <div className="w-2 h-2 rounded-full" />
+        {status}
+      </div>
+    );
+  };
+
+  // Render remote video(s)
+  const renderRemote = () => {
+    const map = webrtc?.remoteStreams || {};
+    const keys = Object.keys(map);
+    if (!keys.length) {
+      return (
+        <div className="w-full h-full flex items-center justify-center">
+          <div className="text-center text-gray-400">
+            <div className="text-2xl font-semibold mb-2">Waiting for other participant</div>
+            <div className="text-sm">They will appear here once they join.</div>
+          </div>
+        </div>
+      );
+    }
+    // show the first remote as main
+    const first = keys[0];
+    return (
+      <video
+        className="w-full h-full object-cover"
+        autoPlay
+        playsInline
+        ref={(el) => { if (el && map[first]) el.srcObject = map[first]; }}
+      />
+    );
+  };
 
   return (
-    <div className="min-h-screen bg-[#0a0a0f]">
+    <div className="min-h-screen bg-[#07070b] text-white">
       <Navbar />
 
       <main className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
-        {!isInCall ? (
-          /* Pre-call Lobby */
-          <motion.div
-            initial={{ opacity: 0, y: 20 }}
-            animate={{ opacity: 1, y: 0 }}
-            transition={{ duration: 0.5 }}
-            className="max-w-2xl mx-auto"
-          >
+        {!joinRequested ? (
+          <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} className="max-w-3xl mx-auto">
             <Card className="p-8">
-              <div className="text-center mb-8">
-                <div className="w-16 h-16 mx-auto mb-4 rounded-2xl bg-gradient-to-br from-indigo-600 to-purple-600 flex items-center justify-center">
-                  <Video className="w-8 h-8 text-white" />
+              <div className="flex items-center justify-between mb-6">
+                <div>
+                  <h1 className="text-2xl font-bold">Interview Lobby</h1>
+                  <p className="text-sm text-gray-400">Meeting ID: <span className="font-mono text-indigo-400">{meetingId}</span></p>
                 </div>
-                <h1 className="text-2xl font-bold text-white mb-2">
-                  Interview Room
-                </h1>
-                <p className="text-gray-400">
-                  Meeting ID: <span className="font-mono text-indigo-400">{meetingId}</span>
-                </p>
+                <div>{renderStatusBadge()}</div>
               </div>
 
-              {/* Video Preview */}
-              <div className="relative aspect-video rounded-2xl overflow-hidden bg-gradient-to-br from-indigo-900/50 to-purple-900/50 mb-6 border border-white/10">
-                {isCameraOn ? (
-                  <div className="absolute inset-0 flex items-center justify-center">
-                    <div className="text-center">
-                      <div className="w-24 h-24 mx-auto mb-4 rounded-full bg-gradient-to-br from-indigo-500 to-purple-500 flex items-center justify-center text-3xl font-bold text-white">
-                        ME
-                      </div>
-                      <p className="text-gray-400">Camera Preview</p>
+              <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+                <div className="lg:col-span-2">
+                  <div className="aspect-video rounded-2xl overflow-hidden bg-black mb-4">
+                    <video ref={localPreviewRef} autoPlay muted playsInline className="w-full h-full object-cover bg-black" />
+                  </div>
+
+                  <div className="flex items-center gap-4 mb-4">
+                    <div className={`px-3 py-1 rounded-xl ${cameraReady ? 'bg-green-600/20 text-green-300' : 'bg-red-600/10 text-red-300'}`}>
+                      {cameraReady ? 'Camera ready ✓' : 'Camera not available'}
                     </div>
-                </div>
-                ) : (
-                  <div className="absolute inset-0 flex items-center justify-center bg-[#131323]">
-                    <div className="text-center">
-                      <VideoOff className="w-12 h-12 mx-auto mb-4 text-gray-600" />
-                      <p className="text-gray-500">Camera is off</p>
+                    <div className={`px-3 py-1 rounded-xl ${micReady ? 'bg-green-600/20 text-green-300' : 'bg-red-600/10 text-red-300'}`}>
+                      {micReady ? 'Microphone ready ✓' : 'Microphone not available'}
                     </div>
                   </div>
-                )}
 
-                {/* Status Badge */}
-                <div className="absolute top-4 left-4 flex items-center gap-2 px-3 py-1.5 rounded-full bg-black/50 backdrop-blur-sm">
-                  <div className="w-2 h-2 rounded-full bg-green-500 animate-pulse" />
-                  <span className="text-xs text-white">Ready to join</span>
-                </div>
-              </div>
+                  {deviceError && (
+                    <div className="mb-4 p-3 rounded bg-red-900 text-red-100">{deviceError}. Please allow camera and microphone access in your browser settings.</div>
+                  )}
 
-              {/* Controls */}
-              <div className="flex items-center justify-center gap-4 mb-8">
-                <motion.button
-                  whileHover={{ scale: 1.1 }}
-                  whileTap={{ scale: 0.9 }}
-                  onClick={() => setIsMicOn(!isMicOn)}
-                  className={`w-14 h-14 rounded-full flex items-center justify-center transition-all ${
-                    isMicOn
-                      ? "bg-white/10 text-white hover:bg-white/20"
-                      : "bg-red-500/20 text-red-500 hover:bg-red-500/30"
-                  }`}
-                >
-                  {isMicOn ? <Mic className="w-5 h-5" /> : <MicOff className="w-5 h-5" />}
-                </motion.button>
-
-                <motion.button
-                  whileHover={{ scale: 1.1 }}
-                  whileTap={{ scale: 0.9 }}
-                  onClick={() => setIsCameraOn(!isCameraOn)}
-                  className={`w-14 h-14 rounded-full flex items-center justify-center transition-all ${
-                    isCameraOn
-                      ? "bg-white/10 text-white hover:bg-white/20"
-                      : "bg-red-500/20 text-red-500 hover:bg-red-500/30"
-                  }`}
-                >
-                  {isCameraOn ? <Video className="w-5 h-5" /> : <VideoOff className="w-5 h-5" />}
-                </motion.button>
-
-                <motion.button
-                  whileHover={{ scale: 1.1 }}
-                  whileTap={{ scale: 0.9 }}
-                  onClick={() => setShowSettings(!showSettings)}
-                  className="w-14 h-14 rounded-full bg-white/10 text-white hover:bg-white/20 flex items-center justify-center transition-all"
-                >
-                  <Settings className="w-5 h-5" />
-                </motion.button>
-              </div>
-
-              {/* Join Button */}
-              <Button
-                fullWidth
-                size="large"
-                onClick={handleJoinCall}
-                leftIcon={<Video className="w-5 h-5" />}
-              >
-                Join Interview
-              </Button>
-
-              {/* Tips */}
-              <div className="mt-6 p-4 rounded-xl bg-indigo-500/10 border border-indigo-500/20">
-                <div className="flex items-start gap-3">
-                  <Sparkles className="w-5 h-5 text-indigo-400 flex-shrink-0 mt-0.5" />
-                  <div>
-                    <h3 className="text-sm font-semibold text-white mb-1">
-                      AI Interview Assistant
-                    </h3>
-                    <p className="text-sm text-gray-400">
-                      Our AI will analyze communication patterns, technical responses,
-                      and provide real-time insights during the interview.
-                    </p>
+                  <div className="flex items-center gap-3">
+                    <Button size="large" onClick={handleJoinCall} leftIcon={<Video className="w-5 h-5" />} disabled={!!deviceError}>
+                      Join Interview
+                    </Button>
+                    <Button variant="secondary" onClick={() => navigate('/dashboard')}>Back to dashboard</Button>
                   </div>
+                </div>
+
+                <div>
+                  <Card className="p-4">
+                    <h3 className="text-sm font-semibold mb-2">Pre-call checks</h3>
+                    <ul className="text-sm space-y-2 text-gray-300">
+                      <li>{cameraReady ? 'Camera ✓' : 'Camera ✕'}</li>
+                      <li>{micReady ? 'Microphone ✓' : 'Microphone ✕'}</li>
+                      <li>Network: {webrtc?.connected ? 'Connected' : 'Unknown'}</li>
+                    </ul>
+                  </Card>
+
+                  <Card className="mt-4 p-4">
+                    <h3 className="text-sm font-semibold mb-2">Tips</h3>
+                    <p className="text-sm text-gray-400">Use a wired connection for best quality. Close other apps that use the camera or microphone.</p>
+                  </Card>
                 </div>
               </div>
             </Card>
           </motion.div>
         ) : (
-          /* Active Call */
-          <motion.div
-            initial={{ opacity: 0 }}
-            animate={{ opacity: 1 }}
-            transition={{ duration: 0.5 }}
-          >
-            {/* Header */}
+          <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }}>
             <div className="flex items-center justify-between mb-6">
               <div>
-                <h1 className="text-xl font-bold text-white">Interview in Progress</h1>
+                <h1 className="text-xl font-bold">Interview in Progress</h1>
                 <div className="flex items-center gap-2 text-sm text-gray-400">
-                  <span className="flex items-center gap-1">
-                    <div className="w-2 h-2 rounded-full bg-green-500 animate-pulse" />
-                    Live
-                  </span>
+                  <span className="flex items-center gap-1"><div className="w-2 h-2 rounded-full bg-green-500 animate-pulse" />Live</span>
                   <span>•</span>
                   <span className="font-mono">{meetingId}</span>
                   <span>•</span>
-                  <span className="flex items-center gap-1">
-                    <Clock className="w-4 h-4" />
-                    {formatTime(time)}
-                  </span>
+                  <span className="flex items-center gap-1"><Clock className="w-4 h-4" />{formatTime(time)}</span>
                 </div>
               </div>
-              <Button
-                variant="danger"
-                leftIcon={<Phone className="w-4 h-4" />}
-                onClick={handleLeaveCall}
-              >
-                End Call
-              </Button>
+
+              <div className="flex items-center gap-3">
+                {renderStatusBadge()}
+                <Button variant="danger" leftIcon={<Phone className="w-4 h-4" />} onClick={handleLeaveCall}>End Call</Button>
+              </div>
             </div>
 
             <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
-              {/* Main Video Area */}
               <div className="lg:col-span-2">
                 <Card className="aspect-video relative overflow-hidden">
-                  {/* Main Video */}
                   <div className="absolute inset-0 bg-gradient-to-br from-indigo-900/30 to-purple-900/30 flex items-center justify-center">
-                    <div className="text-center">
-                      <div className="w-32 h-32 mx-auto mb-4 rounded-full bg-gradient-to-br from-indigo-500 to-purple-500 flex items-center justify-center text-4xl font-bold text-white">
-                        JD
-                      </div>
-                      <p className="text-white font-semibold">John Doe</p>
-                      <p className="text-sm text-gray-400">Candidate</p>
-                    </div>
+                    {webrtc ? renderRemote() : <div className="text-gray-400">Connecting...</div>}
                   </div>
 
-                  {/* AI Analysis Overlay */}
-                  <div className="absolute bottom-4 left-4 right-4">
-                    <Card className="p-4 backdrop-blur-xl bg-black/50 border-white/10">
-                      <div className="flex items-center gap-2 mb-2">
-                        <Sparkles className="w-4 h-4 text-indigo-400" />
-                        <span className="text-sm font-semibold text-white">
-                          AI Analysis
-                        </span>
-                      </div>
-                      <div className="grid grid-cols-3 gap-4">
-                        <div>
-                          <div className="flex justify-between text-xs mb-1">
-                            <span className="text-gray-400">Communication</span>
-                            <span className="text-green-400">85%</span>
-                          </div>
-                          <div className="h-1.5 bg-white/10 rounded-full overflow-hidden">
-                            <div
-                              className="h-full bg-gradient-to-r from-green-500 to-emerald-500 rounded-full"
-                              style={{ width: "85%" }}
-                            />
-                          </div>
-                        </div>
-                        <div>
-                          <div className="flex justify-between text-xs mb-1">
-                            <span className="text-gray-400">Technical</span>
-                            <span className="text-indigo-400">78%</span>
-                          </div>
-                          <div className="h-1.5 bg-white/10 rounded-full overflow-hidden">
-                            <div
-                              className="h-full bg-gradient-to-r from-indigo-500 to-purple-500 rounded-full"
-                              style={{ width: "78%" }}
-                            />
-                          </div>
-                        </div>
-                        <div>
-                          <div className="flex justify-between text-xs mb-1">
-                            <span className="text-gray-400">Confidence</span>
-                            <span className="text-blue-400">92%</span>
-                          </div>
-                          <div className="h-1.5 bg-white/10 rounded-full overflow-hidden">
-                            <div
-                              className="h-full bg-gradient-to-r from-blue-500 to-cyan-500 rounded-full"
-                              style={{ width: "92%" }}
-                            />
-                          </div>
-                        </div>
-                      </div>
-                    </Card>
+                  {/* Local floating preview */}
+                  <div className="absolute bottom-6 right-6 w-44 h-28 rounded-lg overflow-hidden border border-white/10">
+                    <video
+                      autoPlay
+                      muted
+                      playsInline
+                      ref={(el) => { if (el && (webrtc?.localStream || previewStream)) el.srcObject = webrtc?.localStream || previewStream; }}
+                      className="w-full h-full object-cover"
+                    />
                   </div>
                 </Card>
               </div>
 
-              {/* Sidebar */}
               <div className="space-y-6">
-                {/* Participants */}
                 <Card>
                   <Card.Header>
                     <div className="flex items-center justify-between">
-                      <h2 className="text-sm font-semibold text-white flex items-center gap-2">
-                        <Users className="w-4 h-4" />
-                        Participants
-                      </h2>
-                      <span className="text-xs text-gray-500">
-                        {mockParticipants.length}
-                      </span>
+                      <h2 className="text-sm font-semibold text-white flex items-center gap-2"><Users className="w-4 h-4" /> Participants</h2>
+                      <span className="text-xs text-gray-500">{webrtc?.participants?.length || 0}</span>
                     </div>
                   </Card.Header>
                   <Card.Content>
                     <div className="space-y-2">
-                      {mockParticipants.map((participant) => (
-                        <div
-                          key={participant.id}
-                          className="flex items-center gap-3 p-2 rounded-lg hover:bg-white/5 transition-colors"
-                        >
-                          <div className="w-8 h-8 rounded-full bg-gradient-to-br from-indigo-500 to-purple-500 flex items-center justify-center text-white text-sm font-semibold">
-                            {participant.avatar}
-                          </div>
+                      {(webrtc?.participants || []).map((p) => (
+                        <div key={p.socketId} className="flex items-center gap-3 p-2 rounded-lg hover:bg-white/5 transition-colors">
+                          <div className="w-8 h-8 rounded-full bg-gradient-to-br from-indigo-500 to-purple-500 flex items-center justify-center text-white text-sm font-semibold">{(p.name||'U').charAt(0)}</div>
                           <div className="flex-1 min-w-0">
-                            <p className="text-sm font-medium text-white truncate">
-                              {participant.name}
-                            </p>
-                            <p className="text-xs text-gray-500">
-                              {participant.role}
-                            </p>
+                            <p className="text-sm font-medium text-white truncate">{p.name || 'Participant'}</p>
+                            <p className="text-xs text-gray-500">{p.role || ''}</p>
                           </div>
-                          {participant.isSpeaking && (
-                            <div className="flex items-center gap-0.5">
-                              <span className="w-1 h-3 bg-green-500 rounded-full animate-pulse" />
-                              <span className="w-1 h-4 bg-green-500 rounded-full animate-pulse [animation-delay:0.1s]" />
-                              <span className="w-1 h-2 bg-green-500 rounded-full animate-pulse [animation-delay:0.2s]" />
-                            </div>
-                          )}
+                          {/* speaking indicator placeholder */}
                         </div>
                       ))}
+
+                      {(!webrtc?.participants || webrtc.participants.length <= 1) && (
+                        <div className="p-3 text-sm text-gray-400">Waiting for interviewer/candidate to join...</div>
+                      )}
                     </div>
                   </Card.Content>
                 </Card>
 
-                {/* Quick Actions */}
                 <Card>
                   <Card.Header>
-                    <h2 className="text-sm font-semibold text-white">Actions</h2>
+                    <h2 className="text-sm font-semibold text-white">Controls</h2>
                   </Card.Header>
                   <Card.Content>
                     <div className="grid grid-cols-2 gap-3">
-                      <Button
-                        variant="secondary"
-                        size="small"
-                        fullWidth
-                        onClick={() => setIsScreenSharing(!isScreenSharing)}
-                        leftIcon={<Monitor className="w-4 h-4" />}
-                      >
-                        {isScreenSharing ? "Stop Share" : "Share Screen"}
-                      </Button>
-                      <Button
-                        variant="secondary"
-                        size="small"
-                        fullWidth
-                        leftIcon={<Maximize2 className="w-4 h-4" />}
-                      >
-                        Fullscreen
-                      </Button>
+                      <Button variant="ghost" size="small" fullWidth onClick={toggleMic} leftIcon={webrtc?.localStream && webrtc.localStream.getAudioTracks()[0]?.enabled ? <Mic /> : <MicOff />}>Mic</Button>
+                      <Button variant="ghost" size="small" fullWidth onClick={toggleCamera} leftIcon={webrtc?.localStream && webrtc.localStream.getVideoTracks()[0]?.enabled ? <Video /> : <VideoOff />}>Camera</Button>
+                      <Button variant="secondary" size="small" fullWidth onClick={startScreenShare} leftIcon={<Monitor />}>Share Screen</Button>
+                      <Button variant="secondary" size="small" fullWidth leftIcon={<Maximize2 />}>Fullscreen</Button>
                     </div>
                   </Card.Content>
                 </Card>
 
-                {/* AI Insights */}
                 <Card>
                   <Card.Header>
-                    <h2 className="text-sm font-semibold text-white flex items-center gap-2">
-                      <Sparkles className="w-4 h-4 text-indigo-400" />
-                      AI Insights
-                    </h2>
+                    <h2 className="text-sm font-semibold text-white flex items-center gap-2"><Sparkles className="w-4 h-4 text-indigo-400" /> AI Insights</h2>
                   </Card.Header>
                   <Card.Content>
-                    <div className="space-y-3">
-                      <div className="flex items-start gap-2">
-                        <CheckCircle className="w-4 h-4 text-green-500 flex-shrink-0 mt-0.5" />
-                        <p className="text-sm text-gray-400">
-                          Strong communication skills detected
-                        </p>
-                      </div>
-                      <div className="flex items-start gap-2">
-                        <CheckCircle className="w-4 h-4 text-green-500 flex-shrink-0 mt-0.5" />
-                        <p className="text-sm text-gray-400">
-                          Good eye contact maintained
-                        </p>
-                      </div>
-                      <div className="flex items-start gap-2">
-                        <AlertCircle className="w-4 h-4 text-yellow-500 flex-shrink-0 mt-0.5" />
-                        <p className="text-sm text-gray-400">
-                          Consider asking more technical questions
-                        </p>
-                      </div>
-                    </div>
+                    <p className="text-sm text-gray-400">AI assistant will provide analysis after the interview. (Coming soon)</p>
                   </Card.Content>
                 </Card>
               </div>
             </div>
+
+            {/* transient notice */}
+            {notice && <div className="fixed bottom-6 left-1/2 transform -translate-x-1/2 bg-black/80 px-4 py-2 rounded text-sm">{notice}</div>}
+
+            {/* socket / media errors */}
+            {webrtc?.error && (
+              <div className="fixed top-6 right-6 bg-red-900 text-red-100 px-3 py-2 rounded">{webrtc.error.message}</div>
+            )}
           </motion.div>
         )}
       </main>
