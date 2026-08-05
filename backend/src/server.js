@@ -1,3 +1,4 @@
+import http from "http";
 import express from "express";
 import morgan from "morgan";
 import helmet from "helmet";
@@ -9,6 +10,7 @@ import { connectDB } from "./lib/db.js";
 import authRoute from "./routes/auth.route.js";
 import interviewRoute from "./routes/interview.route.js";
 import { errorHandler } from "./middleware/error.middleware.js";
+import { initSocket } from "./socket/socket.js";
 
 const app = express();
 
@@ -58,5 +60,9 @@ app.use((req, res, next) => {
 // 7) Centralized error handler
 app.use(errorHandler);
 
+// Create HTTP server and attach Socket.IO
+const server = http.createServer(app);
+const io = initSocket(server);
+
 // Start server
-app.listen(ENV.PORT, () => console.log("server is running on port:", ENV.PORT));
+server.listen(ENV.PORT, () => console.log("server is running on port:", ENV.PORT));
