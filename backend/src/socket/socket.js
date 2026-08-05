@@ -5,14 +5,24 @@ import User from "../models/User.js";
 import { ENV } from "../lib/env.js";
 
 /**
- * Socket.IO initialization and handlers (presence foundation)
- * - Validates JWT during handshake
- * - Allows join/leave of rooms by meetingId
+ * initSocket(httpServer)
+ * - Validates JWT on handshake
+ * - Handles join-room / leave-room
  * - Maintains in-memory participant lists per room
- * - Emits peer:joined / peer:left / participants:update events
+ * - Emits peer:joined / peer:left and participants:update
+ * - Forwards WebRTC signaling events between peers (offer/answer/ice)
+ *
+ * Note: presence map is intentionally in-memory for single-server setups.
  */
 
 const rooms = {}; // { meetingId: { socketId: participantSummary } }
+
+function findMeetingIdForSocket(socketId) {
+  for (const meetingId of Object.keys(rooms)) {
+    if (rooms[meetingId] && rooms[meetingId][socketId]) return meetingId;
+  }
+  return null;
+}
 
 export function initSocket(httpServer) {
   const io = new Server(httpServer, {
@@ -53,23 +63,24 @@ export function initSocket(httpServer) {
       io.to(meetingId).emit("participants:update", { meetingId, participants: list });
     };
 
+    // Join a meeting room
     socket.on("join-room", async ({ meetingId }) => {
       try {
-        if (!meetingId) {
-          socket.emit("error", { message: "Missing meetingId" });
+        if (typeof meetingId !== "string" || meetingId.trim() === "") {
+          socket.emit("socket:error", { message: "Invalid meetingId" });
           return;
         }
 
         const interview = await Interview.findOne({ meetingId }).lean();
         if (!interview) {
-          socket.emit("error", { message: "Interview not found" });
+          socket.emit("socket:error", { message: "Interview not found" });
           return;
         }
 
         const uid = String(user._id);
         const isParticipant = [String(interview.interviewer), String(interview.candidate)].includes(uid);
         if (!isParticipant) {
-          socket.emit("error", { message: "Forbidden: not a participant of this interview" });
+          socket.emit("socket:error", { message: "Forbidden: not a participant of this interview" });
           return;
         }
 
@@ -81,6 +92,7 @@ export function initSocket(httpServer) {
           name: user.name,
           role: user.role,
           connectedAt: new Date().toISOString(),
+          lastSeen: new Date().toISOString(),
         };
 
         // notify others
@@ -95,14 +107,17 @@ export function initSocket(httpServer) {
         console.log(`[socket] ${user.email} joined room ${meetingId}`);
       } catch (err) {
         console.error("join-room error:", err);
-        socket.emit("error", { message: "Failed to join room" });
+        socket.emit("socket:error", { message: "Failed to join room" });
       }
     });
 
+    // Leave room voluntarily
     socket.on("leave-room", ({ meetingId }) => {
       try {
         if (rooms[meetingId] && rooms[meetingId][socket.id]) {
           delete rooms[meetingId][socket.id];
+          // cleanup empty room
+          if (Object.keys(rooms[meetingId]).length === 0) delete rooms[meetingId];
         }
         socket.leave(meetingId);
         socket.to(meetingId).emit("peer:left", { socketId: socket.id });
@@ -114,22 +129,76 @@ export function initSocket(httpServer) {
       }
     });
 
+    // Client can request current participants
     socket.on("get-participants", ({ meetingId }, cb) => {
       const list = rooms[meetingId] ? Object.values(rooms[meetingId]) : [];
       if (cb && typeof cb === "function") cb({ meetingId, participants: list });
     });
 
+    // Heartbeat
     socket.on("presence:heartbeat", ({ meetingId }) => {
       if (rooms[meetingId] && rooms[meetingId][socket.id]) {
         rooms[meetingId][socket.id].lastSeen = new Date().toISOString();
       }
     });
 
+    // WebRTC signaling: offer
+    socket.on("webrtc:offer", ({ to, sdp }) => {
+      try {
+        // validate that sender and receiver are in same meeting
+        const fromMeeting = findMeetingIdForSocket(socket.id);
+        const toMeeting = findMeetingIdForSocket(to);
+        if (!fromMeeting || fromMeeting !== toMeeting) {
+          socket.emit("socket:error", { message: "Peer not in same room or unknown" });
+          return;
+        }
+        io.to(to).emit("webrtc:offer", { from: socket.id, sdp, user: { id: socket.user._id, name: socket.user.name } });
+      } catch (err) {
+        console.error("webrtc:offer error", err);
+        socket.emit("socket:error", { message: "Failed to forward offer" });
+      }
+    });
+
+    // WebRTC signaling: answer
+    socket.on("webrtc:answer", ({ to, sdp }) => {
+      try {
+        const fromMeeting = findMeetingIdForSocket(socket.id);
+        const toMeeting = findMeetingIdForSocket(to);
+        if (!fromMeeting || fromMeeting !== toMeeting) {
+          socket.emit("socket:error", { message: "Peer not in same room or unknown" });
+          return;
+        }
+        io.to(to).emit("webrtc:answer", { from: socket.id, sdp });
+      } catch (err) {
+        console.error("webrtc:answer error", err);
+        socket.emit("socket:error", { message: "Failed to forward answer" });
+      }
+    });
+
+    // WebRTC signaling: ICE candidate
+    socket.on("webrtc:ice-candidate", ({ to, candidate }) => {
+      try {
+        const fromMeeting = findMeetingIdForSocket(socket.id);
+        const toMeeting = findMeetingIdForSocket(to);
+        if (!fromMeeting || fromMeeting !== toMeeting) {
+          socket.emit("socket:error", { message: "Peer not in same room or unknown" });
+          return;
+        }
+        io.to(to).emit("webrtc:ice-candidate", { from: socket.id, candidate });
+      } catch (err) {
+        console.error("webrtc:ice-candidate error", err);
+        socket.emit("socket:error", { message: "Failed to forward ICE candidate" });
+      }
+    });
+
+    // Clean up when socket disconnects
     socket.on("disconnecting", () => {
       const joinedRooms = Array.from(socket.rooms).filter((r) => r !== socket.id);
       joinedRooms.forEach((meetingId) => {
         if (rooms[meetingId]) {
           delete rooms[meetingId][socket.id];
+          // cleanup empty room
+          if (Object.keys(rooms[meetingId]).length === 0) delete rooms[meetingId];
           socket.to(meetingId).emit("peer:left", { socketId: socket.id, userId: user._id });
           broadcastParticipants(meetingId);
         }
@@ -140,6 +209,7 @@ export function initSocket(httpServer) {
       console.log("[socket] disconnected:", socket.id, "reason=", reason);
     });
 
+    // Debug helper
     socket.on("rooms:debug", (cb) => {
       if (cb && typeof cb === "function") cb({ rooms });
     });
