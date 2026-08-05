@@ -8,6 +8,10 @@ import { io } from "socket.io-client";
  * - Manages localMedia, remote streams, RTCPeerConnections
  * - Forwards signaling via socket events: webrtc:offer/answer/ice-candidate
  * - Maintains participants list from server events
+ *
+ * Options:
+ * - iceServers: array
+ * - devices: { audioDeviceId, videoDeviceId }
  */
 export default function useWebRTC({ serverUrl, meetingId, token, options = {} }) {
   const socketRef = useRef(null);
@@ -21,7 +25,11 @@ export default function useWebRTC({ serverUrl, meetingId, token, options = {} })
   const [inCall, setInCall] = useState(false);
   const [error, setError] = useState(null);
 
+  const HEARTBEAT_MS = 10000; // send heartbeat every 10s
+  const heartbeatRef = useRef(null);
+
   const ICE_SERVERS = options.iceServers || { iceServers: [{ urls: "stun:stun.l.google.com:19302" }] };
+  const devices = options.devices || {};
 
   const addRemoteStream = useCallback((id, stream) => {
     remoteStreamsRef.current = { ...remoteStreamsRef.current, [id]: stream };
@@ -31,7 +39,6 @@ export default function useWebRTC({ serverUrl, meetingId, token, options = {} })
   const removeRemoteStream = useCallback((id) => {
     const copy = { ...remoteStreamsRef.current };
     if (copy[id]) {
-      // stop tracks on old stream
       try {
         copy[id].getTracks().forEach((t) => t.stop());
       } catch (e) {}
@@ -46,13 +53,21 @@ export default function useWebRTC({ serverUrl, meetingId, token, options = {} })
 
     setError(null);
 
-    const socket = io(serverUrl, { auth: { token }, transports: ["websocket", "polling"] });
+    const socket = io(serverUrl, {
+      auth: { token },
+      transports: ["websocket", "polling"],
+      reconnectionAttempts: 5,
+    });
     socketRef.current = socket;
 
-    // request local media
+    // request local media with chosen devices
     const startLocal = async () => {
       try {
-        const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+        const constraints = {
+          video: devices.videoDeviceId ? { deviceId: { exact: devices.videoDeviceId } } : true,
+          audio: devices.audioDeviceId ? { deviceId: { exact: devices.audioDeviceId } } : true,
+        };
+        const stream = await navigator.mediaDevices.getUserMedia(constraints);
         localStreamRef.current = stream;
         setLocalStream(stream);
       } catch (err) {
@@ -63,25 +78,64 @@ export default function useWebRTC({ serverUrl, meetingId, token, options = {} })
 
     startLocal();
 
+    // connection events
     socket.on("connect", () => {
       setConnected(true);
       // Join the meeting; server authorizes
-      socket.emit("join-room", { meetingId });
+      try {
+        socket.emit("join-room", { meetingId });
+      } catch (e) {}
+
+      // start heartbeat
+      if (heartbeatRef.current) clearInterval(heartbeatRef.current);
+      heartbeatRef.current = setInterval(() => {
+        try {
+          socket.emit("presence:heartbeat", { meetingId });
+        } catch (e) {}
+      }, HEARTBEAT_MS);
+    });
+
+    socket.on("connect_error", (err) => {
+      console.error("socket connect_error", err?.message || err);
+      setError({ type: "socket", message: err?.message || "Socket connection failed" });
+      // if unauthorized, bubble up auth type
+      if (err && /auth|token|Authentication/i.test(err.message || "")) {
+        setError({ type: "auth", message: err.message || "Authentication failed" });
+      }
+    });
+
+    socket.on("reconnect_attempt", () => {
+      setError({ type: "socket", message: "Reconnecting..." });
+    });
+
+    socket.on("reconnect", (attempt) => {
+      setError(null);
+      setConnected(true);
+      try {
+        socket.emit("join-room", { meetingId });
+      } catch (e) {}
     });
 
     socket.on("disconnect", (reason) => {
       setConnected(false);
       console.warn("socket disconnected", reason);
+      if (heartbeatRef.current) {
+        clearInterval(heartbeatRef.current);
+        heartbeatRef.current = null;
+      }
     });
 
+    // When we receive participants ack, decide who creates offers deterministically to avoid collisions
     socket.on("joined", ({ participants: list }) => {
       setInCall(true);
       setParticipants(list || []);
-      // create offers to existing participants (except ourselves)
+      // create offers only when our socket.id is lexicographically smaller to avoid collision
       (list || []).forEach((p) => {
-        if (p.socketId && p.socketId !== socket.id) {
-          createOffer(p.socketId);
-        }
+        try {
+          if (p.socketId && p.socketId !== socket.id && socket.id < p.socketId) {
+            createOffer(p.socketId);
+          }
+        } catch (e) {}
       });
     });
 
@@ -90,13 +144,11 @@ export default function useWebRTC({ serverUrl, meetingId, token, options = {} })
     });
 
     socket.on("peer:joined", ({ socketId, user }) => {
-      // update participants will be broadcast by server; show transient message if needed
-      // create offer to the joining peer
-      if (socketId !== socket.id) createOffer(socketId);
+      // on peer joined, only the peer with smaller id initiates
+      if (socketId !== socket.id && socket.id < socketId) createOffer(socketId);
     });
 
     socket.on("peer:left", ({ socketId }) => {
-      // cleanup pc + remote stream
       const pc = pcsRef.current[socketId];
       if (pc) {
         try { pc.close(); } catch (e) {}
@@ -105,7 +157,7 @@ export default function useWebRTC({ serverUrl, meetingId, token, options = {} })
       removeRemoteStream(socketId);
     });
 
-    // Signaling
+    // Signaling handlers
     socket.on("webrtc:offer", async ({ from, sdp }) => {
       try {
         const pc = await createPeerConnection(from);
@@ -140,16 +192,20 @@ export default function useWebRTC({ serverUrl, meetingId, token, options = {} })
 
     socket.on("socket:error", (payload) => {
       console.warn("socket error", payload);
-      // keep for UI handling
       setError({ type: "socket", message: payload?.message || "Socket error" });
     });
 
     // cleanup on unmount
     return () => {
       try { socket.emit("leave-room", { meetingId }); } catch (e) {}
-      socket.disconnect();
+      try { socket.off(); } catch (e) {}
+      try { socket.disconnect(); } catch (e) {}
       setConnected(false);
       setInCall(false);
+      if (heartbeatRef.current) {
+        clearInterval(heartbeatRef.current);
+        heartbeatRef.current = null;
+      }
       Object.values(pcsRef.current).forEach((pc) => { try { pc.close(); } catch (e) {} });
       pcsRef.current = {};
       if (localStreamRef.current) {
@@ -165,7 +221,7 @@ export default function useWebRTC({ serverUrl, meetingId, token, options = {} })
       setParticipants([]);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [serverUrl, meetingId, token]);
+  }, [serverUrl, meetingId, token, devices?.videoDeviceId, devices?.audioDeviceId]);
 
   const createPeerConnection = useCallback(async (remoteId) => {
     if (pcsRef.current[remoteId]) return pcsRef.current[remoteId];
@@ -176,7 +232,7 @@ export default function useWebRTC({ serverUrl, meetingId, token, options = {} })
       localStreamRef.current.getTracks().forEach((track) => pc.addTrack(track, localStreamRef.current));
     }
 
-    // collect remote
+    // collect remote streams
     pc.ontrack = (e) => {
       e.streams.forEach((s) => addRemoteStream(remoteId, s));
     };
@@ -187,9 +243,20 @@ export default function useWebRTC({ serverUrl, meetingId, token, options = {} })
       }
     };
 
-    pc.onconnectionstatechange = () => {
+    pc.onconnectionstatechange = async () => {
       const state = pc.connectionState;
-      if (state === "failed" || state === "disconnected" || state === "closed") {
+      if (state === "failed") {
+        // try ICE restart via new offer
+        try {
+          const offer = await pc.createOffer({ iceRestart: true });
+          await pc.setLocalDescription(offer);
+          if (socketRef.current) socketRef.current.emit("webrtc:offer", { to: remoteId, sdp: pc.localDescription });
+        } catch (e) {
+          console.warn("ICE restart failed", e);
+        }
+      }
+
+      if (state === "disconnected" || state === "closed") {
         try { pc.close(); } catch (e) {}
         delete pcsRef.current[remoteId];
         removeRemoteStream(remoteId);
@@ -198,14 +265,14 @@ export default function useWebRTC({ serverUrl, meetingId, token, options = {} })
 
     pcsRef.current[remoteId] = pc;
     return pc;
-  }, [addRemoteStream, removeRemoteStream]);
+  }, [addRemoteStream, removeRemoteStream, ICE_SERVERS]);
 
-  const createOffer = useCallback(async (remoteId) => {
+  const createOffer = useCallback(async (remoteId, opts = {}) => {
     try {
       const pc = await createPeerConnection(remoteId);
-      const offer = await pc.createOffer();
+      const offer = await pc.createOffer(opts);
       await pc.setLocalDescription(offer);
-      socketRef.current.emit("webrtc:offer", { to: remoteId, sdp: pc.localDescription });
+      if (socketRef.current) socketRef.current.emit("webrtc:offer", { to: remoteId, sdp: pc.localDescription });
     } catch (err) {
       console.error("createOffer", err);
     }
@@ -261,6 +328,10 @@ export default function useWebRTC({ serverUrl, meetingId, token, options = {} })
     setParticipants([]);
     setInCall(false);
     setConnected(false);
+    if (heartbeatRef.current) {
+      clearInterval(heartbeatRef.current);
+      heartbeatRef.current = null;
+    }
   }, [meetingId]);
 
   return {
