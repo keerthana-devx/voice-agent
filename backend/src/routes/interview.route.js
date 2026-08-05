@@ -1,10 +1,11 @@
 import express from "express";
 import Interview from "../models/Interview.js";
+import { requireAuth } from "../middleware/auth.middleware.js";
 
 const router = express.Router();
 
 // Get interviews for a specific user (either as interviewer or candidate)
-router.get("/my-interviews/:userId", async (req, res) => {
+router.get("/my-interviews/:userId", requireAuth, async (req, res) => {
     try {
         const { userId } = req.params;
 
@@ -33,7 +34,7 @@ router.get("/my-interviews/:userId", async (req, res) => {
 });
 
 // Get single interview by meeting ID
-router.get("/meeting/:meetingId", async (req, res) => {
+router.get("/meeting/:meetingId", requireAuth, async (req, res) => {
     try {
         const { meetingId } = req.params;
 
@@ -61,7 +62,7 @@ router.get("/meeting/:meetingId", async (req, res) => {
 });
 
 // Update interview status
-router.patch("/:interviewId/status", async (req, res) => {
+router.patch("/:interviewId/status", requireAuth, async (req, res) => {
     try {
         const { interviewId } = req.params;
         const { status } = req.body;
@@ -93,7 +94,7 @@ router.patch("/:interviewId/status", async (req, res) => {
     }
 });
 
-router.post("/create", async (req, res) => {
+router.post("/create", requireAuth, async (req, res) => {
 
     try {
 
